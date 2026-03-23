@@ -1,15 +1,16 @@
 "use client";
 
 import Link from "next/link";
-import { ChangeEvent, useEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createDefaultState, defaultRules, demoNumbers } from "@/lib/defaults";
 import { createSequenceState, getJamesBondProfit, getStakeBreakdown, refreshSequence } from "@/lib/progression";
 import { getColour } from "@/lib/roulette";
-import { buildSpinFromNumber, buildTrackerSnapshot } from "@/lib/triggers";
 import { downloadText, loadState, saveState, spinsToCsv } from "@/lib/storage";
+import { buildSpinFromNumber, buildTrackerSnapshot } from "@/lib/triggers";
 import { AppState, Spin, Status, TriggerRule } from "@/lib/types";
 
 type View = "dashboard" | "log" | "settings" | "calculator" | "help";
+type RawSpinDraft = { number: number; betTaken: boolean; createdAt?: string; notes?: string; triggerLabel?: string };
 
 const navItems: { href: string; label: string; view: View }[] = [
   { href: "/", label: "Dashboard", view: "dashboard" },
@@ -62,16 +63,124 @@ function SmallMetric({ label, value, sub, tone }: { label: string; value: string
   );
 }
 
+function MiniBarChart({ values, labels, colorClass }: { values: number[]; labels: string[]; colorClass: string }) {
+  const max = Math.max(1, ...values);
+  return (
+    <div className="grid grid-cols-3 gap-3 sm:grid-cols-6">
+      {values.map((value, i) => (
+        <div key={`${labels[i]}-${value}`} className="space-y-2">
+          <div className="flex h-28 items-end rounded-xl border border-white/10 bg-slate-950/70 p-2">
+            <div className={cls("w-full rounded-md", colorClass)} style={{ height: `${Math.max(8, (value / max) * 100)}%` }} />
+          </div>
+          <div className="text-center text-xs text-slate-400">{labels[i]}</div>
+          <div className="text-center text-sm font-medium text-white">{value}</div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function recomputeStateFromDrafts(baseState: AppState, drafts: RawSpinDraft[]) {
+  let nextState: AppState = {
+    ...baseState,
+    spins: [],
+    sequence: createSequenceState(baseState.settings),
+  };
+
+  for (const draft of drafts) {
+    const { spin } = buildSpinFromNumber(
+      draft.number,
+      nextState.spins,
+      nextState.rules,
+      nextState.settings.minimumWatchScore,
+      nextState.settings.minimumEntryScore
+    );
+
+    let finalSpin: Spin = {
+      ...spin,
+      createdAt: draft.createdAt ?? spin.createdAt,
+      notes: draft.notes,
+      triggerLabel: draft.triggerLabel,
+    };
+
+    if (draft.betTaken) {
+      const breakdown = getStakeBreakdown(nextState.sequence.nextScale);
+      const pnl = getJamesBondProfit(draft.number, nextState.sequence.nextScale);
+      const covered = pnl > 0;
+      const nextOpenLosses = covered
+        ? nextState.settings.autoResetAfterCoveredWin
+          ? 0
+          : Math.max(0, nextState.sequence.openLosses - pnl)
+        : nextState.sequence.openLosses + breakdown.totalStake;
+
+      const refreshedBase = refreshSequence(nextOpenLosses, nextState.settings, {
+        active: !covered || !nextState.settings.autoResetAfterCoveredWin,
+        betsTaken: nextState.sequence.betsTaken + 1,
+        wins: nextState.sequence.wins + (covered ? 1 : 0),
+        losses: nextState.sequence.losses + (covered ? 0 : 1),
+        runningPL: nextState.sequence.runningPL + pnl,
+        currentLosingSequence: covered ? 0 : nextState.sequence.currentLosingSequence + 1,
+        longestLosingSequence: covered
+          ? nextState.sequence.longestLosingSequence
+          : Math.max(nextState.sequence.longestLosingSequence, nextState.sequence.currentLosingSequence + 1),
+      });
+
+      const peak = Math.max(0, nextState.sequence.runningPL, refreshedBase.runningPL);
+      const currentDrawdown = Math.max(0, peak - refreshedBase.runningPL);
+      const refreshed = {
+        ...refreshedBase,
+        currentDrawdown,
+        maxDrawdown: Math.max(nextState.sequence.maxDrawdown, currentDrawdown),
+      };
+
+      finalSpin = {
+        ...finalSpin,
+        betTaken: true,
+        scaleUsed: nextState.sequence.nextScale,
+        totalStake: breakdown.totalStake,
+        stakeZero: breakdown.stakeZero,
+        stakeMid: breakdown.stakeMid,
+        stakeHigh: breakdown.stakeHigh,
+        spinPL: pnl,
+        runningPL: refreshed.runningPL,
+        openLossesAfter: refreshed.openLosses,
+      };
+
+      nextState = {
+        ...nextState,
+        sequence: refreshed,
+        spins: [finalSpin, ...nextState.spins],
+      };
+    } else {
+      finalSpin = {
+        ...finalSpin,
+        betTaken: false,
+        runningPL: nextState.sequence.runningPL,
+        openLossesAfter: nextState.sequence.openLosses,
+      };
+      nextState = {
+        ...nextState,
+        spins: [finalSpin, ...nextState.spins],
+      };
+    }
+  }
+
+  return nextState;
+}
+
 export function RouletteApp({ view }: { view: View }) {
   const [state, setState] = useState<AppState>(() => loadState() ?? createDefaultState());
   const [editId, setEditId] = useState<string | null>(null);
+  const [editNumber, setEditNumber] = useState<number>(0);
+  const [editBetTaken, setEditBetTaken] = useState<boolean>(false);
   const [manualBetTaken, setManualBetTaken] = useState(true);
+  const [keyboardBuffer, setKeyboardBuffer] = useState("");
   const fileRef = useRef<HTMLInputElement>(null);
+  const keyboardTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     saveState(state);
   }, [state]);
-
 
   const tracker = useMemo(() => buildTrackerSnapshot(state.spins), [state.spins]);
   const lastSpin = state.spins[0];
@@ -82,75 +191,46 @@ export function RouletteApp({ view }: { view: View }) {
   const exceedsTable = nextBreakdown.totalStake > state.settings.tableMaxStake;
   const safeStepEstimate = Math.max(0, Math.floor(state.settings.bankroll / Math.max(1, nextStakeCash)));
 
-  function persistSpins(nextSpins: Spin[]) {
-    setState((current) => ({ ...current, spins: nextSpins }));
-  }
+  const rawDrafts = useMemo<RawSpinDraft[]>(() => {
+    const oldestFirst = [...state.spins].reverse();
+    return oldestFirst.map((spin) => ({
+      number: spin.number,
+      betTaken: spin.betTaken,
+      createdAt: spin.createdAt,
+      notes: spin.notes,
+      triggerLabel: spin.triggerLabel,
+    }));
+  }, [state.spins]);
 
-  function applyBetToSpin(spin: Spin, customBetTaken = manualBetTaken): { spin: Spin; nextSequence: AppState["sequence"] } {
-    if (!customBetTaken) {
-      return {
-        spin: { ...spin, betTaken: false, runningPL: state.sequence.runningPL, openLossesAfter: state.sequence.openLosses },
-        nextSequence: state.sequence,
-      };
-    }
-
-    const pnl = getJamesBondProfit(spin.number, state.sequence.nextScale);
-    const covered = pnl > 0;
-    const nextOpenLosses = covered
-      ? state.settings.autoResetAfterCoveredWin
-        ? 0
-        : Math.max(0, state.sequence.openLosses - pnl)
-      : state.sequence.openLosses + nextBreakdown.totalStake;
-
-    const refreshedBase = refreshSequence(nextOpenLosses, state.settings, {
-      active: !covered || !state.settings.autoResetAfterCoveredWin,
-      betsTaken: state.sequence.betsTaken + 1,
-      wins: state.sequence.wins + (covered ? 1 : 0),
-      losses: state.sequence.losses + (covered ? 0 : 1),
-      runningPL: state.sequence.runningPL + pnl,
-      currentLosingSequence: covered ? 0 : state.sequence.currentLosingSequence + 1,
-      longestLosingSequence: covered
-        ? state.sequence.longestLosingSequence
-        : Math.max(state.sequence.longestLosingSequence, state.sequence.currentLosingSequence + 1),
-    });
-
-    const peak = Math.max(0, state.sequence.runningPL, refreshedBase.runningPL);
-    const currentDrawdown = Math.max(0, peak - refreshedBase.runningPL);
-    const refreshed = {
-      ...refreshedBase,
-      currentDrawdown,
-      maxDrawdown: Math.max(state.sequence.maxDrawdown, currentDrawdown),
-    };
-
+  const zoneCounts = useMemo(() => {
+    const source = state.spins.slice(0, 24);
     return {
-      spin: {
-        ...spin,
-        betTaken: true,
-        scaleUsed: state.sequence.nextScale,
-        totalStake: nextBreakdown.totalStake,
-        stakeZero: nextBreakdown.stakeZero,
-        stakeMid: nextBreakdown.stakeMid,
-        stakeHigh: nextBreakdown.stakeHigh,
-        spinPL: pnl,
-        runningPL: refreshed.runningPL,
-        openLossesAfter: refreshed.openLosses,
-      },
-      nextSequence: refreshed,
+      uncovered: source.filter((s) => s.jamesBondZone === "uncovered").length,
+      mid: source.filter((s) => s.jamesBondZone === "mid").length,
+      high: source.filter((s) => s.jamesBondZone === "high").length,
+      zero: source.filter((s) => s.jamesBondZone === "zero").length,
     };
-  }
+  }, [state.spins]);
 
-  function handleSpin(number: number) {
+  const pnlSeries = useMemo(() => state.spins.filter((s) => s.betTaken).slice(0, 12).reverse().map((s) => s.runningPL ?? 0), [state.spins]);
+  const triggerSeries = useMemo(() => state.spins.slice(0, 12).reverse().map((s) => s.triggerScore), [state.spins]);
+
+  const commitSpin = useCallback((number: number, betTaken = manualBetTaken) => {
     if (number < 0 || number > 36) return;
-    const { spin } = buildSpinFromNumber(number, state.spins, state.rules, state.settings.minimumWatchScore, state.settings.minimumEntryScore);
-    const result = applyBetToSpin(spin);
-    setState((current) => ({ ...current, spins: [result.spin, ...current.spins], sequence: result.nextSequence }));
-  }
+    const nextDrafts = [...rawDrafts, { number, betTaken }];
+    setState((current) => recomputeStateFromDrafts({ ...current }, nextDrafts));
+  }, [manualBetTaken, rawDrafts]);
 
-  function undoLastSpin() {
-    setState((current) => {
-      const [, ...rest] = current.spins;
-      return { ...current, spins: rest };
-    });
+  const undoLastSpin = useCallback(() => {
+    const nextDrafts = rawDrafts.slice(0, -1);
+    setState((current) => recomputeStateFromDrafts({ ...current }, nextDrafts));
+  }, [rawDrafts]);
+
+  function clearKeyboardTimer() {
+    if (keyboardTimerRef.current) {
+      clearTimeout(keyboardTimerRef.current);
+      keyboardTimerRef.current = null;
+    }
   }
 
   useEffect(() => {
@@ -158,20 +238,50 @@ export function RouletteApp({ view }: { view: View }) {
       if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement || event.target instanceof HTMLSelectElement) return;
       if (event.key === "Backspace") {
         event.preventDefault();
-        undoLastSpin();
+        if (keyboardBuffer) {
+          setKeyboardBuffer((value) => value.slice(0, -1));
+        } else {
+          undoLastSpin();
+        }
+        return;
+      }
+      if (event.key === "Enter") {
+        if (keyboardBuffer === "") return;
+        const parsed = Number(keyboardBuffer);
+        setKeyboardBuffer("");
+        clearKeyboardTimer();
+        if (!Number.isNaN(parsed) && parsed >= 0 && parsed <= 36) commitSpin(parsed);
         return;
       }
       if (event.key.toLowerCase() === "b") {
         setManualBetTaken((v) => !v);
+        return;
       }
-      const number = Number(event.key);
-      if (!Number.isNaN(number) && event.key.length === 1) {
-        handleSpin(number);
+      if (/^[0-9]$/.test(event.key)) {
+        const next = `${keyboardBuffer}${event.key}`;
+        if (Number(next) > 36) {
+          const single = Number(event.key);
+          setKeyboardBuffer("");
+          clearKeyboardTimer();
+          commitSpin(single);
+          return;
+        }
+        setKeyboardBuffer(next);
+        clearKeyboardTimer();
+        keyboardTimerRef.current = setTimeout(() => {
+          const parsed = Number(next);
+          setKeyboardBuffer("");
+          if (!Number.isNaN(parsed) && parsed >= 0 && parsed <= 36) commitSpin(parsed);
+        }, 800);
       }
     }
+
     window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  });
+    return () => {
+      clearKeyboardTimer();
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [keyboardBuffer, commitSpin, undoLastSpin]);
 
   function clearSession() {
     if (!window.confirm("Clear the whole session? This will remove local spin history for this prototype.")) return;
@@ -179,54 +289,9 @@ export function RouletteApp({ view }: { view: View }) {
   }
 
   function seedDemo() {
-    let nextState = createDefaultState();
-    nextState = { ...nextState, settings: state.settings, rules: state.rules };
-    for (const number of demoNumbers) {
-      const { spin } = buildSpinFromNumber(number, nextState.spins, nextState.rules, nextState.settings.minimumWatchScore, nextState.settings.minimumEntryScore);
-      const breakdown = getStakeBreakdown(nextState.sequence.nextScale);
-      const betTaken = spin.status === "ENTER";
-      const pnl = betTaken ? getJamesBondProfit(number, nextState.sequence.nextScale) : undefined;
-      let nextSequence = nextState.sequence;
-      if (betTaken) {
-        const covered = (pnl ?? 0) > 0;
-        const nextOpenLosses = covered
-          ? nextState.settings.autoResetAfterCoveredWin
-            ? 0
-            : Math.max(0, nextState.sequence.openLosses - (pnl ?? 0))
-          : nextState.sequence.openLosses + breakdown.totalStake;
-        nextSequence = refreshSequence(nextOpenLosses, nextState.settings, {
-          active: !covered || !nextState.settings.autoResetAfterCoveredWin,
-          betsTaken: nextState.sequence.betsTaken + 1,
-          wins: nextState.sequence.wins + (covered ? 1 : 0),
-          losses: nextState.sequence.losses + (covered ? 0 : 1),
-          runningPL: nextState.sequence.runningPL + (pnl ?? 0),
-          currentLosingSequence: covered ? 0 : nextState.sequence.currentLosingSequence + 1,
-          longestLosingSequence: covered
-            ? nextState.sequence.longestLosingSequence
-            : Math.max(nextState.sequence.longestLosingSequence, nextState.sequence.currentLosingSequence + 1),
-        });
-      }
-      nextState = {
-        ...nextState,
-        sequence: nextSequence,
-        spins: [
-          {
-            ...spin,
-            betTaken,
-            scaleUsed: betTaken ? nextState.sequence.nextScale : undefined,
-            totalStake: betTaken ? breakdown.totalStake : undefined,
-            stakeZero: betTaken ? breakdown.stakeZero : undefined,
-            stakeMid: betTaken ? breakdown.stakeMid : undefined,
-            stakeHigh: betTaken ? breakdown.stakeHigh : undefined,
-            spinPL: pnl,
-            runningPL: nextSequence.runningPL,
-            openLossesAfter: nextSequence.openLosses,
-          },
-          ...nextState.spins,
-        ],
-      };
-    }
-    setState(nextState);
+    const nextDrafts = demoNumbers.map((number) => ({ number, betTaken: false }));
+    const seeded = recomputeStateFromDrafts({ ...createDefaultState(), settings: state.settings, rules: state.rules, sessionNotes: state.sessionNotes }, nextDrafts);
+    setState(seeded);
   }
 
   function updateRule(ruleId: string, patch: Partial<TriggerRule>) {
@@ -260,11 +325,31 @@ export function RouletteApp({ view }: { view: View }) {
   }
 
   function toggleBetForSpin(spinId: string) {
-    const spin = state.spins.find((s) => s.id === spinId);
-    if (!spin) return;
-    const betTaken = !spin.betTaken;
-    const updatedSpins = state.spins.map((s) => (s.id === spinId ? { ...s, betTaken } : s));
-    persistSpins(updatedSpins);
+    const nextDrafts = rawDrafts.map((draft, index) => {
+      const spin = [...state.spins].reverse()[index];
+      return spin.id === spinId ? { ...draft, betTaken: !draft.betTaken } : draft;
+    });
+    setState((current) => recomputeStateFromDrafts({ ...current }, nextDrafts));
+  }
+
+  function openEdit(spinId: string) {
+    const target = state.spins.find((spin) => spin.id === spinId);
+    if (!target) return;
+    setEditId(spinId);
+    setEditNumber(target.number);
+    setEditBetTaken(target.betTaken);
+  }
+
+  function saveEdit() {
+    if (!editId) return;
+    const reversed = [...state.spins].reverse();
+    const nextDrafts = reversed.map((spin) =>
+      spin.id === editId
+        ? { number: editNumber, betTaken: editBetTaken, createdAt: spin.createdAt, notes: spin.notes, triggerLabel: spin.triggerLabel }
+        : { number: spin.number, betTaken: spin.betTaken, createdAt: spin.createdAt, notes: spin.notes, triggerLabel: spin.triggerLabel }
+    );
+    setState((current) => recomputeStateFromDrafts({ ...current }, nextDrafts));
+    setEditId(null);
   }
 
   const triggerReasons = lastSpin?.triggerReasons ?? [];
@@ -319,10 +404,12 @@ export function RouletteApp({ view }: { view: View }) {
                 </div>
                 <div className="mt-4 grid grid-cols-3 gap-2 sm:grid-cols-6 xl:grid-cols-6">
                   {Array.from({ length: 37 }, (_, n) => (
-                    <button key={n} onClick={() => handleSpin(n)} className={cls("rounded-xl border px-3 py-3 text-sm font-semibold transition hover:scale-[1.02]", numberTone(n))}>{n}</button>
+                    <button key={n} onClick={() => commitSpin(n)} className={cls("rounded-xl border px-3 py-3 text-sm font-semibold transition hover:scale-[1.02]", numberTone(n))}>{n}</button>
                   ))}
                 </div>
-                <div className="mt-3 text-xs text-slate-500">Keyboard: digits 0-9 for quick taps, Backspace = undo, B = toggle next bet.</div>
+                <div className="mt-3 rounded-2xl border border-white/10 bg-slate-950/70 px-4 py-3 text-xs text-slate-400">
+                  Keyboard: type 0–36, then <strong className="text-slate-200">Enter</strong> — or pause briefly to auto-submit. <strong className="text-slate-200">Backspace</strong> edits the buffer or undoes the last spin. <strong className="text-slate-200">B</strong> toggles bet taken. Current buffer: <span className="text-cyan-300">{keyboardBuffer || "—"}</span>
+                </div>
               </Card>
 
               <Card title="Live signal cards">
@@ -355,6 +442,23 @@ export function RouletteApp({ view }: { view: View }) {
                       </ul>
                     )}
                   </div>
+                </div>
+              </Card>
+
+              <Card title="Mini charts">
+                <div className="grid gap-6 xl:grid-cols-2">
+                  <div>
+                    <div className="mb-3 text-sm font-medium text-white">Recent zone distribution</div>
+                    <MiniBarChart values={[zoneCounts.uncovered, zoneCounts.mid, zoneCounts.high, zoneCounts.zero]} labels={["1–12", "13–18", "19–36", "0"]} colorClass="bg-cyan-400/80" />
+                  </div>
+                  <div>
+                    <div className="mb-3 text-sm font-medium text-white">Recent trigger scores</div>
+                    <MiniBarChart values={triggerSeries.length ? triggerSeries : [0]} labels={triggerSeries.length ? triggerSeries.map((_, i) => String(i + 1)) : ["—"]} colorClass="bg-amber-400/80" />
+                  </div>
+                </div>
+                <div className="mt-6">
+                  <div className="mb-3 text-sm font-medium text-white">Running P/L over taken bets</div>
+                  <MiniBarChart values={pnlSeries.length ? pnlSeries.map((v) => Math.abs(v)) : [0]} labels={pnlSeries.length ? pnlSeries.map((_, i) => `B${i + 1}`) : ["—"]} colorClass="bg-emerald-400/80" />
                 </div>
               </Card>
             </div>
@@ -399,7 +503,7 @@ export function RouletteApp({ view }: { view: View }) {
                 <table className="min-w-full text-left text-sm">
                   <thead className="text-slate-400">
                     <tr className="border-b border-white/10">
-                      {['#','Result','Colour','Parity','Range','Dozen','Column','Bond zone','Score','Status','Bet','Scale','Stake','P/L','Open losses','Reasons','Actions'].map((h) => <th key={h} className="px-3 py-3">{h}</th>)}
+                      {["#", "Result", "Colour", "Parity", "Range", "Dozen", "Column", "Bond zone", "Score", "Status", "Bet", "Scale", "Stake", "P/L", "Open losses", "Reasons", "Actions"].map((h) => <th key={h} className="px-3 py-3">{h}</th>)}
                     </tr>
                   </thead>
                   <tbody>
@@ -415,16 +519,16 @@ export function RouletteApp({ view }: { view: View }) {
                         <td className="px-3 py-3 capitalize">{spin.jamesBondZone}</td>
                         <td className="px-3 py-3">{spin.triggerScore}</td>
                         <td className="px-3 py-3"><span className={cls("rounded-full border px-2 py-1 text-xs", statusTone(spin.status))}>{spin.status}</span></td>
-                        <td className="px-3 py-3">{spin.betTaken ? 'Yes' : 'No'}</td>
-                        <td className="px-3 py-3">{spin.scaleUsed ?? '—'}</td>
-                        <td className="px-3 py-3">{spin.totalStake ?? '—'}</td>
-                        <td className="px-3 py-3">{spin.spinPL ?? '—'}</td>
-                        <td className="px-3 py-3">{spin.openLossesAfter ?? '—'}</td>
-                        <td className="px-3 py-3 text-slate-400">{spin.triggerReasons.join('; ')}</td>
+                        <td className="px-3 py-3">{spin.betTaken ? "Yes" : "No"}</td>
+                        <td className="px-3 py-3">{spin.scaleUsed ?? "—"}</td>
+                        <td className="px-3 py-3">{spin.totalStake ?? "—"}</td>
+                        <td className="px-3 py-3">{spin.spinPL ?? "—"}</td>
+                        <td className="px-3 py-3">{spin.openLossesAfter ?? "—"}</td>
+                        <td className="px-3 py-3 text-slate-400">{spin.triggerReasons.join("; ")}</td>
                         <td className="px-3 py-3">
                           <div className="flex flex-col gap-2">
                             <button onClick={() => toggleBetForSpin(spin.id)} className="rounded-lg border border-white/10 bg-white/5 px-2 py-1 text-xs hover:bg-white/10">Toggle bet</button>
-                            <button onClick={() => setEditId(spin.id)} className="rounded-lg border border-white/10 bg-white/5 px-2 py-1 text-xs hover:bg-white/10">Edit</button>
+                            <button onClick={() => openEdit(spin.id)} className="rounded-lg border border-white/10 bg-white/5 px-2 py-1 text-xs hover:bg-white/10">Edit / recalc</button>
                           </div>
                         </td>
                       </tr>
@@ -435,26 +539,22 @@ export function RouletteApp({ view }: { view: View }) {
             </Card>
 
             {editId && (
-              <Card title="Edit prior spin">
-                <div className="flex flex-wrap gap-2">
-                  {Array.from({ length: 37 }, (_, n) => (
-                    <button
-                      key={n}
-                      onClick={() => {
-                        const target = state.spins.find((s) => s.id === editId);
-                        if (!target) return;
-                        const filtered = state.spins.filter((s) => s.id !== editId);
-                        const { spin } = buildSpinFromNumber(n, filtered, state.rules, state.settings.minimumWatchScore, state.settings.minimumEntryScore);
-                        const replacement = { ...target, ...spin, id: target.id, createdAt: target.createdAt };
-                        setState((current) => ({ ...current, spins: [replacement, ...filtered].sort((a, b) => b.index - a.index) }));
-                        setEditId(null);
-                      }}
-                      className={cls("rounded-xl border px-3 py-2 text-sm", numberTone(n))}
-                    >
-                      {n}
-                    </button>
-                  ))}
+              <Card title="Edit prior spin and recalculate forward">
+                <div className="grid gap-4 md:grid-cols-3">
+                  <label className="space-y-2 text-sm text-slate-300">
+                    <span>Result number</span>
+                    <input type="number" min={0} max={36} value={editNumber} onChange={(e) => setEditNumber(Number(e.target.value))} className="w-full rounded-xl border border-white/10 bg-slate-950/70 px-3 py-2" />
+                  </label>
+                  <label className="inline-flex items-center gap-2 rounded-xl border border-white/10 bg-slate-950/70 px-3 py-3 text-sm text-slate-200">
+                    <input type="checkbox" checked={editBetTaken} onChange={(e) => setEditBetTaken(e.target.checked)} />
+                    Bet taken on this spin
+                  </label>
+                  <div className="flex items-end gap-2">
+                    <button onClick={saveEdit} className="rounded-xl bg-cyan-400 px-4 py-2 text-sm font-semibold text-slate-950 hover:bg-cyan-300">Save + recalc</button>
+                    <button onClick={() => setEditId(null)} className="rounded-xl border border-white/10 bg-white/5 px-4 py-2 text-sm text-slate-100 hover:bg-white/10">Cancel</button>
+                  </div>
                 </div>
+                <div className="mt-3 text-sm text-slate-400">This recalculates trigger scores, bet sizing, open losses, and running P/L from that point onward.</div>
               </Card>
             )}
           </div>
@@ -526,8 +626,8 @@ export function RouletteApp({ view }: { view: View }) {
                 <SmallMetric label="Worst covered win" value={`+${nextBreakdown.worstCoveredWinProfit}u`} />
                 <SmallMetric label="Best covered win" value={`+${nextBreakdown.bestCoveredWinProfit}u`} />
                 <SmallMetric label="Uncovered loss" value={`-${nextBreakdown.uncoveredLossAmount}u`} />
-                <SmallMetric label="Bankroll warning" value={exceedsBankroll ? 'Yes' : 'No'} tone={exceedsBankroll ? 'border-rose-400/20 bg-rose-500/10' : undefined} />
-                <SmallMetric label="Table limit warning" value={exceedsTable ? 'Yes' : 'No'} tone={exceedsTable ? 'border-rose-400/20 bg-rose-500/10' : undefined} />
+                <SmallMetric label="Bankroll warning" value={exceedsBankroll ? "Yes" : "No"} tone={exceedsBankroll ? "border-rose-400/20 bg-rose-500/10" : undefined} />
+                <SmallMetric label="Table limit warning" value={exceedsTable ? "Yes" : "No"} tone={exceedsTable ? "border-rose-400/20 bg-rose-500/10" : undefined} />
               </div>
             </Card>
             <Card title="Formula">
@@ -558,7 +658,7 @@ export function RouletteApp({ view }: { view: View }) {
                 <li>No backend, no auth, no payments, no live casino integration.</li>
                 <li>Client-side local storage only.</li>
                 <li>No machine learning, OCR, auto-betting, or claims of predictive power.</li>
-                <li>Charts are intentionally secondary in this prototype.</li>
+                <li>Charts are intentionally small and secondary in this prototype.</li>
               </ul>
             </Card>
           </div>

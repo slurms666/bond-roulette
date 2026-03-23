@@ -52,9 +52,9 @@ Use it for:
 - buttons `0–36`
 - immediate last-spin visibility
 - undo last spin
-- edit prior spin
+- edit prior spin with forward recalculation
 - clear session with confirmation
-- optional keyboard shortcuts
+- multi-digit keyboard entry for 0–36
 
 ### Auto-derived metadata per spin
 - number
@@ -105,6 +105,11 @@ Each spin stores:
 - export session to JSON
 - export spin log to CSV
 - import JSON backup
+
+### Small charts
+- recent zone distribution
+- recent trigger score bars
+- running P/L mini bars
 
 ### Demo session
 - one-click seeded demo session for testing the UI quickly
@@ -180,6 +185,7 @@ npm test
 2. Go to Vercel
 3. Import the repo
 4. Deploy with defaults
+5. `vercel.json` is already included for a simple Next.js deploy
 
 ### Option 2 — Vercel CLI
 ```bash

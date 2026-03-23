@@ -55,6 +55,8 @@ export type TriggerRule = {
   target?: string;
 };
 
+export type StakeSizingMode = "scale" | "customTotalStake";
+
 export type SessionSettings = {
   bankroll: number;
   chipValue: number;
@@ -64,6 +66,8 @@ export type SessionSettings = {
   minimumWatchScore: number;
   minimumEntryScore: number;
   autoResetAfterCoveredWin: boolean;
+  stakeSizingMode: StakeSizingMode;
+  customTotalStake: number;
 };
 
 export type SequenceState = {

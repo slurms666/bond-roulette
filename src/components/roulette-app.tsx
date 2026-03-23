@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { ChangeEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createDefaultState, defaultRules, demoNumbers } from "@/lib/defaults";
-import { createSequenceState, getJamesBondProfit, getStakeBreakdown, refreshSequence } from "@/lib/progression";
+import { createSequenceState, getJamesBondProfit, getRecoveryLadder, getStakeBreakdown, refreshSequence, resolveScaleForSettings } from "@/lib/progression";
 import { getColour } from "@/lib/roulette";
 import { downloadText, loadState, saveState, spinsToCsv } from "@/lib/storage";
 import { buildSpinFromNumber, buildTrackerSnapshot } from "@/lib/triggers";
@@ -184,6 +184,7 @@ export function RouletteApp({ view }: { view: View }) {
 
   const tracker = useMemo(() => buildTrackerSnapshot(state.spins), [state.spins]);
   const lastSpin = state.spins[0];
+  const scaleResolution = useMemo(() => resolveScaleForSettings(state.sequence.openLosses, state.settings), [state.sequence.openLosses, state.settings]);
   const nextBreakdown = useMemo(() => getStakeBreakdown(state.sequence.nextScale), [state.sequence.nextScale]);
   const nextStakeCash = nextBreakdown.totalStake * state.settings.chipValue;
   const bankrollRemaining = state.settings.bankroll - nextStakeCash;
@@ -214,6 +215,7 @@ export function RouletteApp({ view }: { view: View }) {
 
   const pnlSeries = useMemo(() => state.spins.filter((s) => s.betTaken).slice(0, 12).reverse().map((s) => s.runningPL ?? 0), [state.spins]);
   const triggerSeries = useMemo(() => state.spins.slice(0, 12).reverse().map((s) => s.triggerScore), [state.spins]);
+  const recoveryLadder = useMemo(() => getRecoveryLadder(state.settings, state.sequence.openLosses, 6), [state.settings, state.sequence.openLosses]);
 
   const commitSpin = useCallback((number: number, betTaken = manualBetTaken) => {
     if (number < 0 || number > 36) return;
@@ -467,12 +469,19 @@ export function RouletteApp({ view }: { view: View }) {
               <Card title="Progression card">
                 <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-1">
                   <SmallMetric label="Base scale" value={`${state.settings.baseScale}x`} />
-                  <SmallMetric label="Next scale" value={`${state.sequence.nextScale}x`} tone="border-amber-400/20 bg-amber-500/10" />
-                  <SmallMetric label="Next total stake" value={`${nextBreakdown.totalStake}u`} sub={currency(nextStakeCash)} />
+                  <SmallMetric label="Minimum recovery scale" value={`${scaleResolution.minimumRecoveryScale}x`} tone="border-cyan-400/20 bg-cyan-500/10" />
+                  <SmallMetric label="Active next scale" value={`${state.sequence.nextScale}x`} tone="border-amber-400/20 bg-amber-500/10" sub={state.settings.stakeSizingMode === "customTotalStake" ? `Custom stake target: ${state.settings.customTotalStake}u` : "Using minimum recovery sizing"} />
+                  <SmallMetric label="Minimum total needed" value={`${20 * scaleResolution.minimumRecoveryScale}u`} sub={currency(20 * scaleResolution.minimumRecoveryScale * state.settings.chipValue)} />
+                  <SmallMetric label="Next total stake" value={`${nextBreakdown.totalStake}u`} sub={currency(nextStakeCash)} tone={scaleResolution.customStakeTooLow ? "border-rose-400/20 bg-rose-500/10" : undefined} />
                   <SmallMetric label="Stake split" value={`0:${nextBreakdown.stakeZero} • 13–18:${nextBreakdown.stakeMid} • 19–36:${nextBreakdown.stakeHigh}`} />
                   <SmallMetric label="Open losses" value={`${state.sequence.openLosses}u`} />
                   <SmallMetric label="Target buffer" value={`${state.settings.targetProfitBuffer}u`} />
                 </div>
+                {scaleResolution.customStakeTooLow && (
+                  <div className="mt-4 rounded-2xl border border-rose-400/20 bg-rose-500/10 p-4 text-sm text-rose-100">
+                    Custom total stake is below the minimum recovery amount. The tool has raised the active next stake to the minimum needed to cover current open losses plus buffer.
+                  </div>
+                )}
               </Card>
 
               <Card title="Safety card">
@@ -572,6 +581,7 @@ export function RouletteApp({ view }: { view: View }) {
                   ["Target profit buffer", state.settings.targetProfitBuffer, (v: number) => setState((c) => ({ ...c, settings: { ...c.settings, targetProfitBuffer: v } }))],
                   ["Watch score", state.settings.minimumWatchScore, (v: number) => setState((c) => ({ ...c, settings: { ...c.settings, minimumWatchScore: v } }))],
                   ["Entry score", state.settings.minimumEntryScore, (v: number) => setState((c) => ({ ...c, settings: { ...c.settings, minimumEntryScore: v } }))],
+                  ["Custom total stake", state.settings.customTotalStake, (v: number) => setState((c) => ({ ...c, settings: { ...c.settings, customTotalStake: v } }))],
                 ].map(([label, value, setter]) => (
                   <label key={String(label)} className="space-y-2 text-sm text-slate-300">
                     <span>{String(label)}</span>
@@ -581,6 +591,13 @@ export function RouletteApp({ view }: { view: View }) {
                 <label className="inline-flex items-center gap-2 rounded-xl border border-white/10 bg-slate-950/70 px-3 py-3 text-sm text-slate-200">
                   <input type="checkbox" checked={state.settings.autoResetAfterCoveredWin} onChange={(e) => setState((c) => ({ ...c, settings: { ...c.settings, autoResetAfterCoveredWin: e.target.checked } }))} />
                   Auto-reset after covered win
+                </label>
+                <label className="space-y-2 text-sm text-slate-300">
+                  <span>Stake sizing mode</span>
+                  <select value={state.settings.stakeSizingMode} onChange={(e) => setState((c) => ({ ...c, settings: { ...c.settings, stakeSizingMode: e.target.value as "scale" | "customTotalStake" } }))} className="w-full rounded-xl border border-white/10 bg-slate-950/70 px-3 py-2">
+                    <option value="scale">Scale / minimum recovery mode</option>
+                    <option value="customTotalStake">Custom total stake mode</option>
+                  </select>
                 </label>
               </div>
             </Card>
@@ -620,7 +637,10 @@ export function RouletteApp({ view }: { view: View }) {
                 <SmallMetric label="Base scale" value={`${state.settings.baseScale}x`} />
                 <SmallMetric label="Current open losses" value={`${state.sequence.openLosses}u`} />
                 <SmallMetric label="Target profit buffer" value={`${state.settings.targetProfitBuffer}u`} />
-                <SmallMetric label="Next scale" value={`${state.sequence.nextScale}x`} tone="border-amber-400/20 bg-amber-500/10" />
+                <SmallMetric label="Sizing mode" value={state.settings.stakeSizingMode === "customTotalStake" ? "Custom total stake" : "Scale / minimum recovery"} />
+                <SmallMetric label="Minimum scale needed" value={`${scaleResolution.minimumRecoveryScale}x`} tone="border-cyan-400/20 bg-cyan-500/10" />
+                <SmallMetric label="Next scale actually used" value={`${state.sequence.nextScale}x`} tone="border-amber-400/20 bg-amber-500/10" />
+                <SmallMetric label="Minimum total next stake" value={`${20 * scaleResolution.minimumRecoveryScale}u`} sub={currency(20 * scaleResolution.minimumRecoveryScale * state.settings.chipValue)} />
                 <SmallMetric label="Total next stake" value={`${nextBreakdown.totalStake}u`} sub={currency(nextStakeCash)} />
                 <SmallMetric label="Stake split" value={`0:${nextBreakdown.stakeZero} / 13–18:${nextBreakdown.stakeMid} / 19–36:${nextBreakdown.stakeHigh}`} />
                 <SmallMetric label="Worst covered win" value={`+${nextBreakdown.worstCoveredWinProfit}u`} />
@@ -629,9 +649,40 @@ export function RouletteApp({ view }: { view: View }) {
                 <SmallMetric label="Bankroll warning" value={exceedsBankroll ? "Yes" : "No"} tone={exceedsBankroll ? "border-rose-400/20 bg-rose-500/10" : undefined} />
                 <SmallMetric label="Table limit warning" value={exceedsTable ? "Yes" : "No"} tone={exceedsTable ? "border-rose-400/20 bg-rose-500/10" : undefined} />
               </div>
+              {scaleResolution.customStakeTooLow && (
+                <div className="mt-4 rounded-2xl border border-rose-400/20 bg-rose-500/10 p-4 text-sm text-rose-100">
+                  The custom stake target is too small to cover the current open losses. Active stake has been lifted to the minimum recovery amount.
+                </div>
+              )}
             </Card>
-            <Card title="Formula">
-              <div className="rounded-2xl border border-amber-400/20 bg-amber-500/10 p-4 text-sm text-amber-50">
+            <Card title="Recovery ladder">
+              <div className="overflow-x-auto">
+                <table className="min-w-full text-left text-sm">
+                  <thead className="text-slate-400">
+                    <tr className="border-b border-white/10">
+                      <th className="px-3 py-3">Step</th>
+                      <th className="px-3 py-3">Open losses before</th>
+                      <th className="px-3 py-3">Min scale</th>
+                      <th className="px-3 py-3">Stake used</th>
+                      <th className="px-3 py-3">Worst covered win</th>
+                      <th className="px-3 py-3">Lose again</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {recoveryLadder.map((row) => (
+                      <tr key={row.lossStep} className="border-b border-white/5">
+                        <td className="px-3 py-3 text-white">{row.lossStep}</td>
+                        <td className="px-3 py-3">{row.openLossesBefore}u</td>
+                        <td className="px-3 py-3">{row.minimumScaleNeeded}x</td>
+                        <td className="px-3 py-3">{row.totalStake}u / {currency(row.totalStake * state.settings.chipValue)}</td>
+                        <td className="px-3 py-3 text-emerald-300">+{row.worstCoveredWinProfit}u</td>
+                        <td className="px-3 py-3 text-rose-300">{row.openLossesIfLostAgain}u open losses</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <div className="mt-4 rounded-2xl border border-amber-400/20 bg-amber-500/10 p-4 text-sm text-amber-50">
                 <code>nextScale = max(baseScale, ceil((openLosses + targetProfitBuffer) / 8))</code>
               </div>
               <div className="mt-4 space-y-3 text-sm leading-7 text-slate-300">

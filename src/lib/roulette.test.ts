@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { getJamesBondZone, getNumberMeta } from "./roulette";
-import { getJamesBondProfit, getNextScale } from "./progression";
+import { getJamesBondProfit, getNextScale, resolveScaleForSettings } from "./progression";
 import { evaluateTriggerRules, scoreToStatus } from "./triggers";
 import { defaultRules } from "./defaults";
 import { TrackerSnapshot } from "./types";
@@ -43,6 +43,24 @@ describe("recovery progression", () => {
     expect(getNextScale(0, 8, 1)).toBe(1);
     expect(getNextScale(20, 8, 1)).toBe(4);
     expect(getNextScale(100, 8, 1)).toBe(14);
+  });
+
+  it("resolves custom total stake against minimum recovery scale", () => {
+    const resolved = resolveScaleForSettings(20, {
+      bankroll: 500,
+      chipValue: 1,
+      tableMaxStake: 400,
+      baseScale: 1,
+      targetProfitBuffer: 8,
+      minimumWatchScore: 4,
+      minimumEntryScore: 7,
+      autoResetAfterCoveredWin: true,
+      stakeSizingMode: "customTotalStake",
+      customTotalStake: 40,
+    });
+    expect(resolved.minimumRecoveryScale).toBe(4);
+    expect(resolved.activeScale).toBe(4);
+    expect(resolved.customStakeTooLow).toBe(true);
   });
 });
 

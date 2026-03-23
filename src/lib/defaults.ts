@@ -10,6 +10,8 @@ export const defaultSettings: SessionSettings = {
   minimumWatchScore: 4,
   minimumEntryScore: 7,
   autoResetAfterCoveredWin: true,
+  stakeSizingMode: "scale",
+  customTotalStake: 20,
 };
 
 export const defaultRules: TriggerRule[] = [

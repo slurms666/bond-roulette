@@ -4,6 +4,30 @@ export function getNextScale(openLosses: number, targetProfitBuffer: number, bas
   return Math.max(baseScale, Math.ceil((openLosses + targetProfitBuffer) / 8));
 }
 
+export function totalStakeToScale(totalStake: number, baseScale = 1) {
+  return Math.max(baseScale, Math.ceil(totalStake / 20));
+}
+
+export function resolveScaleForSettings(openLosses: number, settings: SessionSettings) {
+  const minimumRecoveryScale = getNextScale(openLosses, settings.targetProfitBuffer, settings.baseScale);
+  if (settings.stakeSizingMode === "customTotalStake") {
+    const customScale = totalStakeToScale(settings.customTotalStake, settings.baseScale);
+    return {
+      minimumRecoveryScale,
+      activeScale: Math.max(minimumRecoveryScale, customScale),
+      customScale,
+      customStakeTooLow: customScale < minimumRecoveryScale,
+    };
+  }
+
+  return {
+    minimumRecoveryScale,
+    activeScale: minimumRecoveryScale,
+    customScale: minimumRecoveryScale,
+    customStakeTooLow: false,
+  };
+}
+
 export function getStakeBreakdown(scale: number) {
   return {
     scale,
@@ -25,12 +49,12 @@ export function getJamesBondProfit(number: number, scale: number) {
 }
 
 export function createSequenceState(settings: SessionSettings): SequenceState {
-  const nextScale = getNextScale(0, settings.targetProfitBuffer, settings.baseScale);
-  const breakdown = getStakeBreakdown(nextScale);
+  const resolved = resolveScaleForSettings(0, settings);
+  const breakdown = getStakeBreakdown(resolved.activeScale);
   return {
     active: false,
     openLosses: 0,
-    nextScale,
+    nextScale: breakdown.scale,
     nextTotalStake: breakdown.totalStake,
     stakeZero: breakdown.stakeZero,
     stakeMid: breakdown.stakeMid,
@@ -47,16 +71,50 @@ export function createSequenceState(settings: SessionSettings): SequenceState {
 }
 
 export function refreshSequence(openLosses: number, settings: SessionSettings, base?: Partial<SequenceState>): SequenceState {
-  const nextScale = getNextScale(openLosses, settings.targetProfitBuffer, settings.baseScale);
-  const breakdown = getStakeBreakdown(nextScale);
+  const resolved = resolveScaleForSettings(openLosses, settings);
+  const breakdown = getStakeBreakdown(resolved.activeScale);
   return {
     ...createSequenceState(settings),
     ...base,
     openLosses,
-    nextScale,
+    nextScale: breakdown.scale,
     nextTotalStake: breakdown.totalStake,
     stakeZero: breakdown.stakeZero,
     stakeMid: breakdown.stakeMid,
     stakeHigh: breakdown.stakeHigh,
   };
+}
+
+export function getRecoveryLadder(settings: SessionSettings, startingOpenLosses: number, steps: number) {
+  const rows: Array<{
+    lossStep: number;
+    openLossesBefore: number;
+    minimumScaleNeeded: number;
+    activeScale: number;
+    totalStake: number;
+    worstCoveredWinProfit: number;
+    bestCoveredWinProfit: number;
+    uncoveredLossIfLostAgain: number;
+    openLossesIfLostAgain: number;
+  }> = [];
+
+  let openLosses = startingOpenLosses;
+  for (let i = 0; i < steps; i += 1) {
+    const resolved = resolveScaleForSettings(openLosses, settings);
+    const breakdown = getStakeBreakdown(resolved.activeScale);
+    rows.push({
+      lossStep: i,
+      openLossesBefore: openLosses,
+      minimumScaleNeeded: resolved.minimumRecoveryScale,
+      activeScale: resolved.activeScale,
+      totalStake: breakdown.totalStake,
+      worstCoveredWinProfit: breakdown.worstCoveredWinProfit,
+      bestCoveredWinProfit: breakdown.bestCoveredWinProfit,
+      uncoveredLossIfLostAgain: breakdown.uncoveredLossAmount,
+      openLossesIfLostAgain: openLosses + breakdown.uncoveredLossAmount,
+    });
+    openLosses += breakdown.uncoveredLossAmount;
+  }
+
+  return rows;
 }
